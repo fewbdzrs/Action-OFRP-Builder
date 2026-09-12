@@ -120,12 +120,22 @@ jobs:
     - name: Building recovery
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       run: |
+        set +e
         cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+
+        echo "===== Step 1: source envsetup ====="
         source build/envsetup.sh
+        echo "envsetup exit code: $?"
+
+        echo "===== Step 2: lunch ====="
         export ALLOW_MISSING_DEPENDENCIES=true
         export LC_ALL=C
         lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+        echo "lunch exit code: $?"
+
+        echo "===== Step 3: mka ====="
         mka adbd ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+        echo "mka exit code: $?"
       continue-on-error: true
 
     - name: Check the output directory before uploading
