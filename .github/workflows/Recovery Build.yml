@@ -1,169 +1,80 @@
-name: Recovery Build
+name: Download OrangeFox Source
 
 on:
   workflow_dispatch:
     inputs:
-      SYNC_URL:
-        description: 'SYNC_URL'
-        required: true
-        default: 'https://gitlab.com/OrangeFox/sync.git'
       MANIFEST_BRANCH:
         description: 'MANIFEST_BRANCH'
         required: true
         default: '12.1'
-      DEVICE_TREE_URL:
-        description: 'DEVICE_TREE_URL'
-        required: true
-        default: 'https://github.com/fewbdzrs/device_zyb_tb8788p1_64_bsp_k419'
-      DEVICE_TREE_BRANCH:
-        description: 'DEVICE_TREE_BRANCH'
-        required: true
-        default: 'main'
-      DEVICE_PATH:
-        description: 'DEVICE_PATH'
-        required: true
-        default: 'device/zyb/tb8788p1_64_bsp_k419'
-      COMMON_TREE_URL:
-        description: 'COMMON_TREE_URL (if no common tree, leave blank)'
-        required: false
-      COMMON_PATH:
-        description: 'COMMON_PATH (if no common tree, leave blank)'
-        required: false
-      DEVICE_NAME:
-        description: 'DEVICE_NAME'
-        required: true
-        default: 'tb8788p1_64_bsp_k419'
-      MAKEFILE_NAME:
-        description: 'MAKEFILE_NAME'
-        required: true
-        default: 'omni_tb8788p1_64_bsp_k419'
-      BUILD_TARGET:
-        description: 'BUILD_TARGET (boot/recovery/vendorboot)'
-        required: true
-        default: 'boot'
 
 jobs:
-  build:
-    if: github.event.repository.owner.id == github.event.sender.id
+  download:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     steps:
 
-    - name: Check Out
-      uses: actions/checkout@v4
-
-    - name: Cleanup
+    - name: Free disk space
       uses: rokibhasansagar/slimhub_actions@main
 
-    - name: Initialize workspace
-      id: pwd
-      run: |
-        mkdir workspace
-        cd workspace
-        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+    - name: Show disk before
+      run: df -h
 
-    - name: Prepare the build environment
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+    - name: Install repo
       run: |
-        sudo apt update && sudo apt upgrade -y
-        DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
-            linux-modules-extra-$(uname -r) \
-            git python3 tar aria2 ccache
-        git clone https://gitlab.com/OrangeFox/misc/scripts
-        cd scripts
-        sudo bash setup/android_build_env.sh
-        sed -i 's/cd -/cd ../g' setup/install_android_sdk.sh
-        sudo bash setup/install_android_sdk.sh
+        mkdir -p ~/bin
+        curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+rx ~/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
 
-    - name: Install OpenJDK
-      uses: actions/setup-java@v4
+    - name: Configure git
+      run: |
+        git config --global user.name "builder"
+        git config --global user.email "builder@local"
+        git config --global http.postBuffer 524288000
+        git config --global core.compression 0
+
+    - name: Init manifest
+      run: |
+        mkdir -p ~/fox && cd ~/fox
+        repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
+          -b twrp-${{ github.event.inputs.MANIFEST_BRANCH }} \
+          --depth=1 --git-lfs
+
+    - name: Sync sources
+      run: |
+        cd ~/fox
+        repo sync -j4 --force-sync --no-clone-bundle --no-tags
+
+    - name: Show disk after
+      run: |
+        df -h
+        du -sh ~/fox
+
+    - name: Cleanup git history to shrink size
+      run: |
+        cd ~/fox
+        # 删除所有 .git 目录，只保留工作文件
+        find . -name ".git" -type d -prune -exec rm -rf {} +
+        find . -name ".repo" -type d -prune -exec rm -rf {} +
+        du -sh ~/fox
+
+    - name: Pack with pigz
+      run: |
+        sudo apt-get install -y pigz
+        cd ~
+        tar --use-compress-program="pigz -6" -cf fox_source.tar.gz fox/
+        ls -lh fox_source.tar.gz
+
+    - name: Split into 1.9GB parts
+      run: |
+        cd ~
+        split -b 1900M fox_source.tar.gz fox_part_
+        ls -lh fox_part_*
+
+    - name: Upload parts
+      uses: actions/upload-artifact@v4
       with:
-        distribution: 'zulu'
-        java-version: '11'
-
-    - name: Setup SSH Keys
-      if: ${{ startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
-                startsWith(github.event.inputs.COMMON_TREE_URL, 'git@github.com') }}
-      uses: webfactory/ssh-agent@v0.9.0
-      with:
-        ssh-private-key: |
-          ${{ secrets.SSH_PRIVATE_KEY }}
-
-    - name: Sync OrangeFox sources and minimal manifest
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-      run: |
-        cd ${{ steps.pwd.outputs.workspace-folder }}
-        git clone ${{ github.event.inputs.SYNC_URL }}
-        cd sync
-        ./orangefox_sync.sh --branch ${{ github.event.inputs.MANIFEST_BRANCH }} --path ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-
-    - name: Clone device tree
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-      run: |
-        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
-
-    - name: Verify device tree
-      run: |
-        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-        echo "===== Device tree structure ====="
-        find ${{ github.event.inputs.DEVICE_PATH }} -maxdepth 3 -type f | sort
-        echo "===== BoardConfig.mk ====="
-        cat ${{ github.event.inputs.DEVICE_PATH }}/BoardConfig.mk
-
-    - name: Set Swap Space
-      uses: pierotofy/set-swap-space@master
-      with:
-        swap-size-gb: 12
-
-    - name: Building recovery
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-      run: |
-        set +e
-        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
-
-        echo "===== Step 1: source envsetup ====="
-        source build/envsetup.sh
-        echo "envsetup exit code: $?"
-
-        echo "===== Step 2: lunch ====="
-        export ALLOW_MISSING_DEPENDENCIES=true
-        export LC_ALL=C
-        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
-        echo "lunch exit code: $?"
-
-        echo "===== Step 3: mka ====="
-        mka adbd ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
-        echo "mka exit code: $?"
-      continue-on-error: true
-
-    - name: Check the output directory before uploading
-      run: |
-        echo "===== Product output ====="
-        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/ || true
-        echo
-        echo "===== Device output ====="
-        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/ || true
-        echo
-        echo "===== Image files ====="
-        find ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/ \
-          -maxdepth 1 -name "*.img" -exec ls -lh {} \; 2>/dev/null || true
-
-    - name: Upload to Release
-      if: success()
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.img
-          ${{ steps.pwd.outputs.workspace-folder }}/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
-        tag_name: ${{ github.run_id }}
-        body: |
-          Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
-          Device: ${{ github.event.inputs.DEVICE_NAME }}
-          Target: ${{ github.event.inputs.BUILD_TARGET }}
-          Platform: MT8183 / MT8788
-          Partition: A/B + recovery-as-boot
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: fox-source
+        path: |
+          ~/fox_part_*
+        retention-days: 7
